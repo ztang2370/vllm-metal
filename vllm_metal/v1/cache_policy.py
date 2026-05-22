@@ -472,6 +472,7 @@ class ModelCachePolicy:
             kv_heads_per_layer=kv_heads,
             head_dim_per_layer=head_dims,
             sliding_window_per_layer=sw_list,
+            elastic=config.elastic_kv,
         )
 
     def _cache_layer_shapes(self, num_cache_layers: int) -> tuple[list[int], list[int]]:
@@ -586,6 +587,17 @@ class WorkerCachePlanner:
             block_size=plan.block_size
         )
         backend.initialize(plan.num_blocks)
+
+        if self._worker.metal_config.elastic_kv:
+            # The MHA backend's ElasticKVPool already provides lazy paging:
+            # the underlying mmap region is PROT_READ|WRITE but unbacked
+            # until written. We don't need an initial madvise sweep.
+            logger.info(
+                "Elastic KV: pool backed by mmap + newBufferWithBytesNoCopy "
+                "(%d blocks per layer, lazy-paged; reclaim on request free)",
+                plan.num_blocks,
+            )
+
         n_patched = backend.patch_model(self._worker.model_runner.model)
         config = get_config()
         if config.kv_sharing_fast_prefill:

@@ -81,6 +81,10 @@ from vllm_metal.v1.structured_output import MetalStructuredOutputApplier
 
 logger = init_logger(__name__)
 
+# How often (in reclaim count) to log an INFO-level elastic KV summary.
+# Set via env or tweak here if too chatty / too quiet.
+_ELASTIC_KV_LOG_EVERY_RECLAIMS = 1
+
 
 SchedulerMemoryReportingMode: TypeAlias = Literal[
     "stt_nominal",
@@ -288,6 +292,9 @@ class MetalModelRunner:
         self._paged_block_size: int = 0
         self._paged_request_seq_lens: dict[str, int] = {}  # req_id → seq_len
         self.kv_cache_dtype: mx.Dtype | None = None
+        # Elastic KV stats counters (logged periodically from
+        # _cleanup_finished_requests).
+        self._elastic_kv_reclaim_calls: int = 0
 
         # Per-layer KV cache shapes (None = uniform across layers)
         self.kv_heads_per_layer: list[int] | None = None
@@ -1489,9 +1496,17 @@ class MetalModelRunner:
                 self._gdn_materialize_pending_state_cache()
             return
 
+        elastic_kv = (
+            self.metal_config.elastic_kv
+            and self._paged_attention_backend is not None
+        )
+        freed_block_ids: list[int] = []
+
         for req_id in evicted_req_ids:
             state = self._request_states.pop(req_id, None)
             if state is not None:
+                if elastic_kv and state.block_ids:
+                    freed_block_ids.extend(state.block_ids)
                 if state.cache:
                     del state.cache
                 del state
@@ -1500,6 +1515,47 @@ class MetalModelRunner:
 
             # Block freeing is handled by the scheduler's kv_cache_manager.
             self._paged_request_seq_lens.pop(req_id, None)
+
+        if elastic_kv and freed_block_ids:
+            # Queue the freed block ranges on the per-layer ElasticKVPools
+            # and trigger reclaim — the mmap dance + MTL::Buffer recreate
+            # is what actually releases physical pages back to the OS and
+            # refreshes the GPU's IOMMU mapping. cache.reclaim()
+            # synchronises before tearing down the old buffer.
+            assert self._paged_attention_backend is not None
+            self._paged_attention_backend.mark_blocks_freed(freed_block_ids)
+            released = self._paged_attention_backend.reclaim()
+            if released:
+                logger.debug(
+                    "Elastic KV reclaimed %.2f MB across %d block ids",
+                    released / 1e6,
+                    len(freed_block_ids),
+                )
+                # Periodic INFO-level summary so users can monitor without
+                # turning on full debug logging. Logs every
+                # _ELASTIC_KV_LOG_EVERY reclaims by cumulative count.
+                self._elastic_kv_reclaim_calls += 1
+                if (
+                    self._elastic_kv_reclaim_calls
+                    % _ELASTIC_KV_LOG_EVERY_RECLAIMS
+                    == 0
+                ):
+                    stats = self._paged_attention_backend.get_stats()
+                    total = stats.get("elastic_total_bytes", 0)
+                    released_total = stats.get(
+                        "elastic_cumulative_released_bytes", 0
+                    )
+                    nrecl = stats.get("elastic_total_reclaim_count", 0)
+                    pending = stats.get("elastic_pending_free_bytes", 0)
+                    logger.info(
+                        "Elastic KV stats: pool=%.2f GB, "
+                        "cumulative_released=%.2f GB, "
+                        "reclaim_count=%d, pending_free=%.2f MB",
+                        total / 1e9,
+                        released_total / 1e9,
+                        nrecl,
+                        pending / 1e6,
+                    )
 
         self._gdn_release_slots(evicted_req_ids)
         if materialize_gdn_state:

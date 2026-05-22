@@ -9,15 +9,19 @@
 // RTTI matching which fails due to hidden symbol visibility in libmlx.
 
 #include <algorithm>
+#include <cstdint>
 #include <string>
 #include <unordered_map>
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/string.h>
+#include <nanobind/stl/vector.h>
 
 #include "mlx/mlx.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/primitives.h"
+
+#include "elastic_kv.h"
 
 namespace nb = nanobind;
 using namespace mlx::core;
@@ -602,6 +606,121 @@ class TQEncodePrimitive : public Primitive {
   bool k_signed_;
 };
 
+// ---------------------------------------------------------------------------
+// Plain (non-quantised) KV scatter primitive — writes K/V into key_cache /
+// value_cache at slot_mapping offsets, with outputs aliasing the input cache
+// buffers via copy_shared_buffer. This is what the elastic-mode KV write
+// path uses to preserve the ElasticKVPool's buffer identity (MLX's
+// functional `arr[idx] = val` would orphan our pool).
+// ---------------------------------------------------------------------------
+class KVScatterPrimitive : public Primitive {
+ public:
+  explicit KVScatterPrimitive(Stream stream) : Primitive(stream) {}
+
+  void eval_cpu(
+      const std::vector<array>&,
+      std::vector<array>&) override {
+    throw std::runtime_error("KVScatterPrimitive only supports GPU");
+  }
+
+  void eval_gpu(
+      const std::vector<array>& inputs,
+      std::vector<array>& outputs) override {
+    // inputs:  0=key, 1=value, 2=key_cache_in, 3=value_cache_in, 4=slot_mapping
+    // outputs: 0=new_key_cache (aliases 2), 1=new_value_cache (aliases 3)
+    outputs[0].copy_shared_buffer(inputs[2]);
+    outputs[1].copy_shared_buffer(inputs[3]);
+
+    const array& key          = inputs[0];
+    const array& value        = inputs[1];
+    const array& slot_mapping = inputs[4];
+
+    auto s = stream();
+    auto& d = metal::device(s.device);
+
+    // key shape: [num_tokens, num_heads, head_size]
+    int num_tokens = static_cast<int>(key.shape(0));
+    int num_heads  = static_cast<int>(key.shape(1));
+    int head_size  = static_cast<int>(key.shape(2));
+    int block_size = static_cast<int>(inputs[2].shape(1));
+
+    auto kv_dt = dtype_to_metal(key.dtype());
+    // Match the kernel name pattern from reshape_and_cache.metal:
+    //   reshape_and_cache_kv_<kv_type>_cache_<cache_type>
+    // We use kv_type == cache_type (no FP8 scaling path on this entry).
+    std::string kname =
+        "reshape_and_cache_kv_" + kv_dt + "_cache_" + kv_dt;
+    bool use_fp8_scales = false;
+    std::string hash_name = kname + "_fp8" + (use_fp8_scales ? "1" : "0");
+    auto* lib = d.get_library("paged_attention_v2_kern");
+    auto* kernel = d.get_kernel(
+        kname, lib, hash_name,
+        // Must match `function_constant(30)` in reshape_and_cache.metal
+        // (which reuses pagedattention.metal's `use_fp8_scales` slot).
+        {{&use_fp8_scales, MTL::DataType::DataTypeBool, NS::UInteger(30)}});
+
+    int key_stride   = static_cast<int>(num_heads * head_size);
+    int value_stride = static_cast<int>(num_heads * head_size);
+
+    auto& enc = get_command_encoder_compat(d, s);
+    enc.set_compute_pipeline_state(kernel);
+    enc.set_input_array(key,             0);
+    enc.set_input_array(value,           1);
+    enc.set_output_array(outputs[0],     2);
+    enc.set_output_array(outputs[1],     3);
+    enc.set_input_array(slot_mapping,    4);
+    // Buffers 5, 6 are k_scale / v_scale — only bound when use_fp8_scales is
+    // true. Skip in our branch.
+    enc.set_bytes(key_stride,            7);
+    enc.set_bytes(value_stride,          8);
+    enc.set_bytes(num_heads,             9);
+    enc.set_bytes(head_size,            10);
+    enc.set_bytes(block_size,           11);
+
+    // The kernel uses one threadgroup per token and a sub-warp's worth of
+    // threads per group, looping over (num_heads * head_size) elements.
+    // 128 threads/group is a safe choice across head sizes — the inner loop
+    // strides by threads_per_threadgroup.
+    constexpr int kThreadsPerGroup = 128;
+    enc.dispatch_threadgroups(
+        MTL::Size::Make(num_tokens, 1, 1),
+        MTL::Size::Make(kThreadsPerGroup, 1, 1));
+  }
+
+  const char* name() const override { return "KVScatter"; }
+
+  bool is_equivalent(const Primitive&) const override { return true; }
+};
+
+static std::vector<array> kv_scatter_primitive_fn(
+    const array& key, const array& value,
+    const array& key_cache, const array& value_cache,
+    const array& slot_mapping) {
+  if (key.ndim() != 3) {
+    throw std::runtime_error(
+        "kv_scatter: key must be [num_tokens, num_heads, head_size]");
+  }
+  if (key_cache.ndim() != 4) {
+    throw std::runtime_error(
+        "kv_scatter: key_cache must be [num_blocks, block_size, num_heads, "
+        "head_size]");
+  }
+  if (key.dtype() != value.dtype() || key.dtype() != key_cache.dtype() ||
+      key.dtype() != value_cache.dtype()) {
+    throw std::runtime_error(
+        "kv_scatter: key/value/caches must share dtype");
+  }
+  if (slot_mapping.dtype() != int64) {
+    throw std::runtime_error("kv_scatter: slot_mapping must be int64");
+  }
+
+  auto prim = std::make_shared<KVScatterPrimitive>(default_stream(Device::gpu));
+  return array::make_arrays(
+      {key_cache.shape(), value_cache.shape()},
+      {key_cache.dtype(), value_cache.dtype()}, prim,
+      {key, value, key_cache, value_cache, slot_mapping});
+}
+
 static std::vector<array> tq_encode_primitive_fn(
     const array& key, const array& value,
     const array& key_cache, const array& value_cache,
@@ -1017,6 +1136,41 @@ NB_MODULE(_paged_ops, m) {
         "q4_0/int4/uint4/int2/uint2 at k_bits in {2,3,4,5,8}). V supports "
         "any v_bits in [1, 8] via the v_centroids buffer.");
 
+  m.def("kv_scatter",
+        [](nb::handle key_h, nb::handle value_h,
+           nb::handle key_cache_h, nb::handle value_cache_h,
+           nb::handle slot_mapping_h) {
+          auto results = kv_scatter_primitive_fn(
+              *nb::inst_ptr<array>(key_h),
+              *nb::inst_ptr<array>(value_h),
+              *nb::inst_ptr<array>(key_cache_h),
+              *nb::inst_ptr<array>(value_cache_h),
+              *nb::inst_ptr<array>(slot_mapping_h));
+
+          // Mint two Python mx.core.array placeholders for the aliased
+          // outputs (same overwrite_descriptor trick tq_encode uses to
+          // sidestep cross-module nanobind RTTI on nb::class_<array>).
+          nb::object mx_core  = nb::module_::import_("mlx.core");
+          nb::object arr_cls  = mx_core.attr("array");
+          nb::object zero_arg = nb::int_(0);
+          nb::object out_k = arr_cls(zero_arg);
+          nb::object out_v = arr_cls(zero_arg);
+          nb::inst_ptr<array>(out_k)->overwrite_descriptor(results[0]);
+          nb::inst_ptr<array>(out_v)->overwrite_descriptor(results[1]);
+          return nb::make_tuple(out_k, out_v);
+        },
+        nb::arg("key"), nb::arg("value"),
+        nb::arg("key_cache"), nb::arg("value_cache"),
+        nb::arg("slot_mapping"),
+        "Plain (non-quantized) in-place KV scatter via a real MLX "
+        "Primitive. Writes key/value into key_cache/value_cache at "
+        "slot_mapping offsets; outputs alias the input cache buffers "
+        "via copy_shared_buffer so the writes preserve buffer identity "
+        "(critical for elastic mode, where MLX's functional "
+        "arr[idx]=val would orphan our ElasticKVPool). Caller MUST "
+        "rebind cache[layer_idx] to the returned arrays so subsequent "
+        "ops see the post-write provenance.");
+
   // Paged attention primitive (read-only): dispatches paged_attention_v2_online.
   // Cache writes are handled by MLX-native scatter upstream.
   // Uses overwrite_descriptor to bypass cross-module nanobind RTTI.
@@ -1117,4 +1271,93 @@ NB_MODULE(_paged_ops, m) {
         "boundary the eager binding requires. Saves ~200 μs at B=1 "
         "small-H cells where dispatch overhead dominates.");
 
+  // -------------------------------------------------------------------------
+  // ElasticKVPool — kvcached-style elastic memory backing for an MLX array.
+  // See elastic_kv.h for the design.
+  // -------------------------------------------------------------------------
+  using vllm_metal::elastic::ElasticKVPool;
+
+  auto parse_dtype = [](const std::string& s) -> Dtype {
+    if (s == "float32") return float32;
+    if (s == "float16") return float16;
+    if (s == "bfloat16") return bfloat16;
+    if (s == "uint8")   return uint8;
+    if (s == "int8")    return int8;
+    if (s == "uint32")  return uint32;
+    if (s == "int32")   return int32;
+    if (s == "uint64")  return uint64;
+    if (s == "int64")   return int64;
+    throw std::invalid_argument("ElasticKVPool: unsupported dtype: " + s);
+  };
+
+  // Helper: copy the pool's current array into a Python placeholder via
+  // overwrite_descriptor (same trick as paged_attention_primitive — avoids
+  // cross-module nanobind RTTI failure on nb::class_<array>).
+  auto publish_array = [](const array& src, nb::handle out_h) {
+    nb::inst_ptr<array>(out_h)->overwrite_descriptor(src);
+  };
+
+  nb::class_<ElasticKVPool>(m, "ElasticKVPool",
+      "Elastic KV memory pool. Wraps an mmap'd region as an mlx::core::array "
+      "by building the MTL::Buffer directly via newBufferWithBytesNoCopy: "
+      "(bypassing MLX's own allocator, which would snapshot-copy our pointer "
+      "into a fresh allocation). Supports per-block free + reclaim that "
+      "actually releases physical pages.")
+      .def("__init__",
+           [&parse_dtype](ElasticKVPool* self, size_t total_bytes,
+                          std::vector<int> shape_vec,
+                          const std::string& dtype_str) {
+             Shape shape(shape_vec.begin(), shape_vec.end());
+             new (self)
+                 ElasticKVPool(total_bytes, std::move(shape), parse_dtype(dtype_str));
+           },
+           nb::arg("total_bytes"), nb::arg("shape"), nb::arg("dtype"),
+           "Construct a pool of `total_bytes` (rounded up to system page "
+           "size). `shape` and `dtype` describe the mlx::core::array view.")
+      .def("publish_array",
+           [&publish_array](ElasticKVPool& self, nb::handle out_h) {
+             publish_array(self.array(), out_h);
+           },
+           nb::arg("out"),
+           "Copy the pool's current mlx::core::array descriptor into the "
+           "given mx.core.array placeholder. Call this after construction and "
+           "after every reclaim() to bind Python references to the live "
+           "array.")
+      .def("mark_freed",
+           [](ElasticKVPool& self, size_t offset, size_t length) {
+             self.mark_freed(offset, length);
+           },
+           nb::arg("offset_bytes"), nb::arg("len_bytes"),
+           "Queue a byte range to be released on the next reclaim().")
+      .def("reclaim",
+           [&publish_array](ElasticKVPool& self, nb::handle out_h) -> size_t {
+             size_t freed = self.reclaim();
+             publish_array(self.array(), out_h);
+             return freed;
+           },
+           nb::arg("out"),
+           "Apply pending mark_freed() ranges: mmap-dance to release physical "
+           "pages, then release()+newBuffer() to refresh the GPU mapping. "
+           "Caller MUST ensure no in-flight GPU work references the old "
+           "array (typically via mx.synchronize()). The pool's new array is "
+           "published into `out`. Returns the number of bytes actually "
+           "released (page-aligned).")
+      .def_prop_ro("total_bytes",
+                   [](const ElasticKVPool& self) { return self.total_bytes(); })
+      .def_prop_ro("freed_pending_bytes",
+                   [](const ElasticKVPool& self) {
+                     return self.freed_pending_bytes();
+                   })
+      .def_prop_ro("base_address",
+                   [](const ElasticKVPool& self) {
+                     return reinterpret_cast<uintptr_t>(self.base_ptr());
+                   })
+      .def_prop_ro("total_released_bytes",
+                   [](const ElasticKVPool& self) {
+                     return self.total_released_bytes();
+                   })
+      .def_prop_ro("total_reclaim_count",
+                   [](const ElasticKVPool& self) {
+                     return self.total_reclaim_count();
+                   });
 }

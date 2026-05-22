@@ -449,3 +449,15 @@ class MLAPagedAttentionBackend:
 
     def num_blocks(self) -> int:
         return self._require_initialized("num_blocks").num_blocks
+
+    def mark_blocks_freed(self, block_ids: list[int]) -> None:
+        # MLA caches use a different layout (single fused latent_cache);
+        # elastic-KV reclamation hasn't been wired here yet — first cut
+        # targets MHA/GQA only. Safe no-op.
+        return
+
+    def reclaim(self) -> int:
+        return 0
+
+    def get_stats(self) -> dict:
+        return {}

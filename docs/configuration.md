@@ -17,6 +17,7 @@
 | `VLLM_METAL_PREFIX_CACHE_FRACTION` | `0.05` | Fraction of MLX working set for prefix cache (0, 1] |
 | `VLLM_METAL_GDN_LAZY_DECODE` | `1` | Enable lazy GDN decode kernels for eligible decode-only hybrid batches. Set to `0` to force the eager conv / C++ recurrent fallback path. |
 | `VLLM_METAL_MLA_KERNEL` | `0` | Enable the experimental absorbed-MLA single-pass Metal decode kernel ([RFC #360](https://github.com/vllm-project/vllm-metal/issues/360)). Off by default; the MLA wrapper falls back to the MLX SDPA per-request slow path. Set to `1` to route absorbed-MLA decode through the kernel when the workload matches the instantiated specialization (`kv_lora_rank=512`, `qk_rope_head_dim=64`, `block_size ∈ {16, 32}`, fp16/bf16, decode-only). |
+| `VLLM_METAL_ELASTIC_KV` | `0` | Experimental elastic KV cache. Backs each per-layer paged KV array with an `mmap`'d region wrapped as an `MTL::Buffer`; freed-request blocks are unmapped + remapped (page-aligned) and the buffer is rebuilt so the GPU sees the fresh mapping. Currently MHA/GQA only — no-op for MLA and hybrid models. See [Elastic KV Cache](#elastic-kv-cache). |
 
 ## Multimodal Serve Modes
 
@@ -42,3 +43,19 @@ This path requires `VLLM_METAL_USE_PAGED_ATTENTION=1` and is currently limited t
 | `auto` | `1` | Yes | Paged KV path (default); defaults to 0.9 internally |
 | `0.7` | `1` | Yes | Paged KV path with explicit memory budget |
 | `0.7` | `0` | No | Explicit fraction without paged KV is invalid |
+
+## Elastic KV Cache
+
+`VLLM_METAL_ELASTIC_KV=1` enables experimental elastic KV semantics on the paged-attention path. The pool is sized the same as today; what changes is when pages are physically backed:
+
+- **Allocation.** Each per-layer K and V cache is replaced by an `ElasticKVPool`. The pool reserves its bytes with `mmap(MAP_ANON|MAP_PRIVATE, PROT_READ|WRITE)` — virtual address space only, with no physical pages committed — and wraps that region as an `MTL::Buffer` via `newBufferWithBytesNoCopy:`. The MLX array view is constructed over that buffer. macOS commits a physical page the first time a KV scatter writes to it.
+- **Request completion.** When a request finishes, the model runner translates its scheduler-assigned block ids into byte ranges and queues them on each layer's pool. Reclaim then runs the **mmap dance** per range — `mmap(MAP_FIXED, PROT_NONE)` followed by `mmap(MAP_FIXED, PROT_READ|WRITE)` — which forcibly drops the physical pages, and rebuilds the `MTL::Buffer` so the GPU's IOMMU mapping captures the fresh (unbacked) pages. The next write to a reclaimed range silently re-commits a zero page.
+
+The net effect is that steady-state RSS tracks actually-touched KV blocks rather than the full pool, leaving more headroom for the rest of the system.
+
+Caveats:
+- The mmap dance is **synchronous** — `reclaim()` calls `mx.synchronize()` first so the old `MTL::Buffer` is no longer referenced by in-flight kernels. Reclaim cost scales with the number of pending ranges; it runs on every request-completion batch in the model runner cleanup hook.
+- Page-aligned only. Ranges are rounded **inward** to system page boundaries (16 KB on Apple Silicon), so partial pages at the ends of a freed range remain backed.
+- Only the MHA/GQA paged backend is wired today. MLA and hybrid (SDPA + recurrent) backends fall back to a no-op for now.
+- Not compatible with TurboQuant in the same cache (`MetalPagedKVCache(elastic=True, turboquant=True)` raises).
+- Requires `VLLM_METAL_USE_PAGED_ATTENTION=1`. Enabling elastic mode without paged attention raises at startup.

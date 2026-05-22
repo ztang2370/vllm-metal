@@ -26,7 +26,11 @@ template <> inline bfloat16_t to_cache<bfloat16_t, bfloat16_t>(bfloat16_t v) {
 
 template <> inline half to_cache<half, half>(half v) { return v; }
 
-constant bool use_fp8_scales [[function_constant(10)]];
+// `use_fp8_scales` is declared in pagedattention.metal (function_constant(30))
+// which is concatenated before this file in the bundled v2 library — the
+// kernel below refers to the same toggle. The previous standalone
+// declaration here clashed when bundled and has been removed.
+extern constant bool use_fp8_scales;
 
 // Cache layout: [num_blocks, block_size, num_heads, head_size]
 // Both key and value caches use the same token-contiguous layout.

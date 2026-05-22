@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     VLLM_METAL_MODELSCOPE_CACHE: str | None = None
     VLLM_METAL_GDN_LAZY_DECODE: bool = True
     VLLM_METAL_MLA_KERNEL: bool = False
+    VLLM_METAL_ELASTIC_KV: bool = False
 
 environment_variables: dict[str, Callable[[], Any]] = {
     # Fraction of unified memory to use.  "auto" (the default) means the
@@ -86,6 +87,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # qk_rope_head_dim=64, block_size ∈ {16, 32}, fp16/bf16,
     # decode-only).
     "VLLM_METAL_MLA_KERNEL": lambda: os.getenv("VLLM_METAL_MLA_KERNEL", "0") == "1",
+    # Elastic KV cache (experimental). When enabled, the paged KV pool is
+    # backed by per-layer ``ElasticKVPool``s: each layer reserves an
+    # mmap'd region wrapped as an MTL::Buffer, so physical pages are only
+    # committed when a KV scatter touches them. When a request finishes,
+    # its block byte-ranges are unmapped + remapped (mmap dance) and the
+    # MTL::Buffer is rebuilt so the GPU sees the fresh mapping. Steady-
+    # state RSS tracks actually-touched blocks rather than the whole
+    # pool; pool size itself is unchanged. Off by default.
+    "VLLM_METAL_ELASTIC_KV": lambda: os.getenv("VLLM_METAL_ELASTIC_KV", "0") == "1",
 }
 
 

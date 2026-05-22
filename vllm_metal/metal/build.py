@@ -20,6 +20,8 @@ logger = logging.getLogger(__name__)
 
 _THIS_DIR = Path(__file__).resolve().parent
 _SRC = _THIS_DIR / "paged_ops.cpp"
+_ELASTIC_SRC = _THIS_DIR / "elastic_kv.cpp"
+_ELASTIC_HDR = _THIS_DIR / "elastic_kv.h"
 _BUILD = _THIS_DIR / "build.py"
 _CONSTANTS = _THIS_DIR / "constants.py"
 _EXT_SUFFIX = sysconfig.get_config_var("EXT_SUFFIX") or ".so"
@@ -98,6 +100,7 @@ def _build_spec() -> _BuildSpec:
         "dynamic_lookup",
         str(nb_src),
         str(_SRC),
+        str(_ELASTIC_SRC),
         "-o",
         str(_OUT),
     ]
@@ -121,7 +124,7 @@ def _input_hash(spec: _BuildSpec) -> str:
     h.update(b"\0")
     # Versions catch in-place upgrades where the install path is reused.
     h.update(f"mlx={spec.mlx_version}\0nb={spec.nb_version}\0".encode())
-    for p in (_SRC, _BUILD, _CONSTANTS, spec.nb_src):
+    for p in (_SRC, _ELASTIC_SRC, _ELASTIC_HDR, _BUILD, _CONSTANTS, spec.nb_src):
         h.update(p.name.encode())
         h.update(b"\0")
         h.update(p.read_bytes())

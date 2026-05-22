@@ -49,6 +49,7 @@ class MetalConfig:
     turboquant: bool = False  # Enable TurboQuant KV cache compression
     k_quant: str = "q8_0"  # Key quantization type: q8_0, q4_0, int8, uint8, etc.
     v_quant: str = "q3_0"  # Value quantization type: q2_0, q3_0, q4_0, q5_0 (Lloyd-Max)
+    elastic_kv: bool = False  # Back paged KV via mmap'd ElasticKVPools; release pages on block free.
 
     def __post_init__(self) -> None:
         if not self.use_paged_attention and not self.is_auto_memory:
@@ -72,6 +73,13 @@ class MetalConfig:
                     f"Invalid VLLM_METAL_MEMORY_FRACTION={self.memory_fraction}. "
                     "Must be a finite value in (0, 1] when paged attention is enabled."
                 )
+
+        if self.elastic_kv and not self.use_paged_attention:
+            raise ValueError(
+                "VLLM_METAL_ELASTIC_KV requires paged attention. "
+                "Enable VLLM_METAL_USE_PAGED_ATTENTION=1 or set "
+                "VLLM_METAL_ELASTIC_KV=0."
+            )
 
         if self.multimodal_mode not in VALID_MULTIMODAL_MODES:
             available = ", ".join(sorted(VALID_MULTIMODAL_MODES))
@@ -141,6 +149,7 @@ class MetalConfig:
             use_paged_attention=use_paged_attention,
             kv_sharing_fast_prefill=kv_sharing_fast_prefill,
             multimodal_mode=envs.VLLM_METAL_MULTIMODAL_MODE,  # type: ignore[arg-type]
+            elastic_kv=envs.VLLM_METAL_ELASTIC_KV,
         )
 
 

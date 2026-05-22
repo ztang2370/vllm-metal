@@ -500,6 +500,22 @@ def sdpa_forward(
         kv_cache.key_scale_caches[layer_idx] = new_key_scale_cache
         kv_cache.value_scale_caches[layer_idx] = new_value_scale_cache
         kv_cache.key_zero_caches[layer_idx] = new_key_zero_cache
+    elif kv_cache.elastic:
+        # Elastic mode requires a true in-place scatter so the
+        # ElasticKVPool's buffer identity is preserved. MLX's functional
+        # `flat[idx] = val` would replace the underlying buffer with a
+        # fresh MLX allocation, orphaning the pool and breaking the
+        # reclaim path. The kv_scatter primitive writes via copy_shared_buffer
+        # aliasing into our pool's MTLBuffer.
+        new_k_cache, new_v_cache = get_ops().kv_scatter(
+            k_3d,
+            v_3d,
+            kv_cache.key_caches[layer_idx],
+            kv_cache.value_caches[layer_idx],
+            slot_mapping,
+        )
+        kv_cache.key_caches[layer_idx] = new_k_cache
+        kv_cache.value_caches[layer_idx] = new_v_cache
     else:
         flat_k = kv_cache.key_caches[layer_idx].reshape(-1, cache_kv_heads, head_dim)
         flat_k[slot_mapping] = k_3d

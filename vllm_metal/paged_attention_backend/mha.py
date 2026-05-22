@@ -34,6 +34,7 @@ class MHAPagedAttentionBackend:
         kv_heads_per_layer: list[int] | None = None,
         head_dim_per_layer: list[int] | None = None,
         sliding_window_per_layer: list[int] | None = None,
+        elastic: bool = False,
     ) -> None:
         self._num_layers = num_layers
         self._num_kv_heads = num_kv_heads
@@ -48,6 +49,7 @@ class MHAPagedAttentionBackend:
         self._kv_heads_per_layer = kv_heads_per_layer
         self._head_dim_per_layer = head_dim_per_layer
         self._sliding_window_per_layer = sliding_window_per_layer
+        self._elastic = elastic
 
     def _require_initialized(self, caller: str) -> MetalPagedKVCache:
         if self._cache is None:
@@ -70,6 +72,7 @@ class MHAPagedAttentionBackend:
             kv_heads_per_layer=self._kv_heads_per_layer,
             head_dim_per_layer=self._head_dim_per_layer,
             sliding_window_per_layer=self._sliding_window_per_layer,
+            elastic=self._elastic,
         )
 
     def patch_model(self, model: Any) -> int:
@@ -89,3 +92,22 @@ class MHAPagedAttentionBackend:
 
     def num_blocks(self) -> int:
         return self._require_initialized("num_blocks").num_blocks
+
+    def mark_blocks_freed(self, block_ids: list[int]) -> None:
+        # Cache may not be initialised yet during warm-up; silently skip.
+        if self._cache is None:
+            return
+        self._cache.mark_blocks_freed(block_ids)
+
+    def reclaim(self) -> int:
+        """Apply queued elastic frees and refresh GPU mappings. Returns the
+        number of bytes actually released. No-op when elastic mode is off
+        or no frees are pending."""
+        if self._cache is None:
+            return 0
+        return self._cache.reclaim()
+
+    def get_stats(self) -> dict:
+        if self._cache is None:
+            return {}
+        return self._cache.get_stats()

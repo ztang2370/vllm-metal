@@ -223,6 +223,19 @@ class HybridPagedAttentionBackend:
     def num_blocks(self) -> int:
         return self._require_initialized("num_blocks").num_blocks
 
+    def mark_blocks_freed(self, block_ids: list[int]) -> None:
+        # Hybrid models use block-size translation (vLLM block_size != kernel
+        # block_size) and a GDN recurrent state cache alongside the SDPA
+        # cache — elastic-KV reclamation requires per-component handling
+        # that hasn't been wired yet. First cut targets MHA/GQA only.
+        return
+
+    def reclaim(self) -> int:
+        return 0
+
+    def get_stats(self) -> dict:
+        return {}
+
     @property
     def kv_cache(self) -> MetalPagedKVCache:
         return self._require_initialized("kv_cache")

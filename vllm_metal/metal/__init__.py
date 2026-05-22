@@ -55,6 +55,10 @@ def _build_v2_paged_attention_source() -> str:
         _read_metal_source(_KERNELS_V2_DIR / "turboquant.metal"),
         _read_metal_source(_KERNELS_V2_DIR / "pagedattention.metal"),
         _read_metal_source(_KERNELS_V2_DIR / "pagedattention_tiled.metal"),
+        # Plain KV scatter — used by the non-quantized cache write path
+        # (including elastic mode, where the in-place semantics matter for
+        # preserving the ElasticKVPool's buffer identity).
+        _read_metal_source(_KERNELS_V2_DIR / "reshape_and_cache.metal"),
     ]
     return "\n".join(parts)
 

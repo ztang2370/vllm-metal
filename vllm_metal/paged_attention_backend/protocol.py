@@ -10,3 +10,20 @@ class PagedAttentionBackend(Protocol):
     def patch_model(self, model: Any) -> int: ...
     def warm_up(self) -> None: ...
     def num_blocks(self) -> int: ...
+
+    def mark_blocks_freed(self, block_ids: list[int]) -> None:
+        """Queue freed block ranges on the per-layer ``ElasticKVPool``s.
+        The physical page release happens on the next ``reclaim()``
+        call. No-op when elastic mode is off."""
+        ...
+
+    def reclaim(self) -> int:
+        """Release queued physical pages and refresh GPU mappings.
+        Returns bytes released. No-op when elastic mode is off."""
+        ...
+
+    def get_stats(self) -> dict:
+        """Return aggregated KV cache stats (sizing + elastic counters
+        when applicable). Returns an empty dict if the backend's cache
+        is not yet initialized."""
+        ...
