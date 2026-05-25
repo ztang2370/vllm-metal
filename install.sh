@@ -192,7 +192,7 @@ EOF
   rm -rf vllm-$vllm_v*
 
   if [[ -n "$local_lib" && -f "$local_lib" ]]; then
-    uv pip install .
+    uv pip install -e .
   else
     local release_data
     release_data=$(fetch_latest_release "$repo_owner" "$repo_name")
