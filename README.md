@@ -36,6 +36,16 @@ https://docs.vllm.ai/en/latest/cli/
 curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm-metal/main/install.sh | bash
 ```
 
+### Editable install
+
+If you're hacking on vllm-metal locally, do an editable install so Python edits take effect without reinstalling. Activate the venv first, then:
+
+```bash
+uv pip install --no-deps -e .
+```
+
+`--no-deps` skips re-resolving dependencies (already installed by `install.sh`). Python changes under [vllm_metal/](vllm_metal/) are live on next import; Rust changes require rerunning the command.
+
 ## Elastic KV Cache (kvcached)
 
 Experimental KV cache mode that lets steady-state memory track actually-used KV blocks instead of the full pool. The pool is sized the same as today; the difference is when pages are physically backed.
