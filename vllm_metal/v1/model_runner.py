@@ -1514,9 +1514,10 @@ class MetalModelRunner:
             self._paged_request_seq_lens.pop(req_id, None)
 
         if elastic_kv:
-            # ``BlockPool.free_blocks`` (patched in compat) has already queued
-            # the truly-released ranges — i.e. blocks that left the request
-            # AND aren't retained by vLLM's prefix cache — on the per-layer
+            # ``BlockPool.free_blocks`` (patched lazily by
+            # ``register_elastic_listener``) has already queued the truly-
+            # released ranges — i.e. blocks that left the request AND aren't
+            # retained by vLLM's prefix cache — on the per-layer
             # ElasticKVPools. We just trigger the synchronize + MTL::Buffer
             # rebuild that actually drops the pages back to the OS.
             assert self._paged_attention_backend is not None
