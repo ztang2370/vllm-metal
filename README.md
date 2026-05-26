@@ -63,7 +63,7 @@ VLLM_METAL_ELASTIC_KV=1 vllm serve <MODEL>
 **Status / caveats.**
 - MHA/GQA paged backend only. MLA and hybrid (SDPA + recurrent) fall back to no-op.
 - Not compatible with TurboQuant in the same cache (`MetalPagedKVCache(elastic=True, turboquant=True)` raises).
-- Prefix caching (`VLLM_METAL_PREFIX_CACHE`) is not supported in elastic mode yet.
+- vLLM prefix caching (`--enable-prefix-caching`) is supported: blocks held by the prefix cache keep their pages backed for reuse; only blocks that vLLM actually releases (cache miss, partial last block, eviction) get reclaimed. Set `VLLM_METAL_ELASTIC_KV_MAX_CACHED_FRACTION=<0..1>` to cap how much of the pool the cache may hold — excess cached blocks evict LRU-oldest and their pages are reclaimed. The legacy non-paged `VLLM_METAL_PREFIX_CACHE` is unrelated and stays a no-op when paged attention is on.
 - Reclaim is synchronous: it calls `mx.synchronize()` then runs the mmap dance per range, so cost scales with the number of ranges finishing per scheduler tick.
 - Partial pages at the ends of a freed range stay backed (ranges round inward to 16 KB).
 

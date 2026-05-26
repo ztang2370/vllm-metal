@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     VLLM_METAL_GDN_LAZY_DECODE: bool = True
     VLLM_METAL_MLA_KERNEL: bool = False
     VLLM_METAL_ELASTIC_KV: bool = False
+    VLLM_METAL_ELASTIC_KV_MAX_CACHED_FRACTION: str = ""
 
 environment_variables: dict[str, Callable[[], Any]] = {
     # Fraction of unified memory to use.  "auto" (the default) means the
@@ -96,6 +97,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # state RSS tracks actually-touched blocks rather than the whole
     # pool; pool size itself is unchanged. Off by default.
     "VLLM_METAL_ELASTIC_KV": lambda: os.getenv("VLLM_METAL_ELASTIC_KV", "0") == "1",
+    # Cap on how much of the elastic KV pool can be held by vLLM's prefix
+    # cache, expressed as a fraction of the pool's block count. Unset / empty
+    # = unbounded (cached blocks keep pages backed until vLLM evicts them on
+    # allocation). A value in (0, 1] forces an LRU on cached-and-freed blocks
+    # so elastic reclaim continues to drop pages under prefix-cache pressure.
+    # 0 = effectively disable prefix-cache retention (evict on free). Only
+    # applies when VLLM_METAL_ELASTIC_KV=1.
+    "VLLM_METAL_ELASTIC_KV_MAX_CACHED_FRACTION": lambda: os.getenv(
+        "VLLM_METAL_ELASTIC_KV_MAX_CACHED_FRACTION", ""
+    ),
 }
 
 

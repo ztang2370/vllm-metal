@@ -12,6 +12,7 @@ import torch
 from vllm.logger import init_logger
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheSpec
 
+from vllm_metal import envs
 from vllm_metal.config import (
     PAGED_ATTENTION_DEFAULT_MEMORY_FRACTION,
     PAGED_ATTENTION_MIN_BLOCKS,
@@ -589,14 +590,29 @@ class WorkerCachePlanner:
         backend.initialize(plan.num_blocks)
 
         if self._worker.metal_config.elastic_kv:
-            # The MHA backend's ElasticKVPool already provides lazy paging:
-            # the underlying mmap region is PROT_READ|WRITE but unbacked
-            # until written. We don't need an initial madvise sweep.
             logger.info(
                 "Elastic KV: pool backed by mmap + newBufferWithBytesNoCopy "
                 "(%d blocks per layer, lazy-paged; reclaim on request free)",
                 plan.num_blocks,
             )
+            # Forward scheduler-side block-free events to this backend's
+            # reclaim queue. The hook filters out blocks retained by vLLM's
+            # prefix cache (block_hash set), so this also unlocks
+            # ``--enable-prefix-caching`` in elastic mode.
+            from vllm_metal.v1.elastic_kv_hooks import register_elastic_listener
+
+            max_cached_blocks = self._elastic_kv_max_cached_blocks(plan.num_blocks)
+            register_elastic_listener(
+                backend, max_cached_blocks=max_cached_blocks
+            )
+            if max_cached_blocks >= 0:
+                logger.info(
+                    "Elastic KV prefix-cache cap: %d/%d blocks "
+                    "(VLLM_METAL_ELASTIC_KV_MAX_CACHED_FRACTION=%s)",
+                    max_cached_blocks,
+                    plan.num_blocks,
+                    envs.VLLM_METAL_ELASTIC_KV_MAX_CACHED_FRACTION,
+                )
 
         n_patched = backend.patch_model(self._worker.model_runner.model)
         config = get_config()
@@ -736,6 +752,35 @@ class WorkerCachePlanner:
             )
             return PAGED_ATTENTION_DEFAULT_MEMORY_FRACTION
         return self._worker.metal_config.memory_fraction
+
+    @staticmethod
+    def _elastic_kv_max_cached_blocks(num_blocks: int) -> int:
+        """Resolve the elastic-KV prefix-cache cap (in blocks) from env.
+
+        Unset/empty → ``-1`` (unbounded; legacy behavior).
+        Out-of-range or unparseable → ``-1`` with a one-line warning.
+        Valid value in ``[0, 1]`` → ``int(fraction * num_blocks)``.
+        """
+        raw = envs.VLLM_METAL_ELASTIC_KV_MAX_CACHED_FRACTION
+        if not raw:
+            return -1
+        try:
+            fraction = float(raw)
+        except ValueError:
+            logger.warning(
+                "Invalid VLLM_METAL_ELASTIC_KV_MAX_CACHED_FRACTION=%r; "
+                "ignoring (using unbounded prefix-cache retention).",
+                raw,
+            )
+            return -1
+        if not (0.0 <= fraction <= 1.0):
+            logger.warning(
+                "VLLM_METAL_ELASTIC_KV_MAX_CACHED_FRACTION=%s out of range [0, 1]; "
+                "ignoring (using unbounded prefix-cache retention).",
+                raw,
+            )
+            return -1
+        return int(fraction * num_blocks)
 
     def _metal_limit_bytes(self) -> int:
         device_info = mx.device_info()

@@ -18,6 +18,7 @@
 | `VLLM_METAL_GDN_LAZY_DECODE` | `1` | Enable lazy GDN decode kernels for eligible decode-only hybrid batches. Set to `0` to force the eager conv / C++ recurrent fallback path. |
 | `VLLM_METAL_MLA_KERNEL` | `0` | Enable the experimental absorbed-MLA single-pass Metal decode kernel ([RFC #360](https://github.com/vllm-project/vllm-metal/issues/360)). Off by default; the MLA wrapper falls back to the MLX SDPA per-request slow path. Set to `1` to route absorbed-MLA decode through the kernel when the workload matches the instantiated specialization (`kv_lora_rank=512`, `qk_rope_head_dim=64`, `block_size ∈ {16, 32}`, fp16/bf16, decode-only). |
 | `VLLM_METAL_ELASTIC_KV` | `0` | Experimental elastic KV cache. Backs each per-layer paged KV array with an `mmap`'d region wrapped as an `MTL::Buffer`; freed-request blocks are unmapped + remapped (page-aligned) and the buffer is rebuilt so the GPU sees the fresh mapping. Currently MHA/GQA only — no-op for MLA and hybrid models. See [Elastic KV Cache](#elastic-kv-cache). |
+| `VLLM_METAL_ELASTIC_KV_MAX_CACHED_FRACTION` | (unset) | Fraction of the elastic KV pool that vLLM's prefix cache may retain. Unset = unbounded (default; cached blocks keep pages backed indefinitely). A value in `[0, 1]` caps retention via LRU eviction so elastic reclaim continues under prefix-cache pressure. Only meaningful when `VLLM_METAL_ELASTIC_KV=1` and `--enable-prefix-caching` is on. |
 
 ## Multimodal Serve Modes
 
@@ -59,3 +60,20 @@ Caveats:
 - Only the MHA/GQA paged backend is wired today. MLA and hybrid (SDPA + recurrent) backends fall back to a no-op for now.
 - Not compatible with TurboQuant in the same cache (`MetalPagedKVCache(elastic=True, turboquant=True)` raises).
 - Requires `VLLM_METAL_USE_PAGED_ATTENTION=1`. Enabling elastic mode without paged attention raises at startup.
+
+### Interaction with prefix caching
+
+Elastic mode composes with vLLM's stock paged prefix caching (`--enable-prefix-caching`). vllm-metal installs a once-per-process hook on `BlockPool.free_blocks` that forwards block releases to the per-layer `ElasticKVPool` reclaim queue — but only for blocks whose `block_hash` is `None` after the free. Blocks the prefix cache retains for cross-request reuse keep their pages backed (otherwise a later cache hit would read garbage), while partial last blocks and other uncached releases drop their pages as usual. Blocks evicted from the prefix cache during a subsequent allocation are immediately reused by the new request, so the hook intentionally does not reclaim them.
+
+By default the prefix cache is uncapped, so a workload with high prefix diversity can fill the entire pool with retained blocks and effectively neutralize elastic reclaim. `VLLM_METAL_ELASTIC_KV_MAX_CACHED_FRACTION` bounds this:
+
+| Setting | Effect |
+|--|--|
+| unset / empty | Unbounded retention (default). |
+| `0` | No retention — every cached block is evicted on free. Equivalent to disabling prefix caching for RSS purposes; cache lookups still hit while a request holds the block. |
+| `0.25` | Up to 25% of the pool may be held by the cache. Excess blocks evict LRU-oldest and their pages reclaim. |
+| `1.0` | Equivalent to unbounded. |
+
+The cap is enforced inside the same `free_blocks` call that pushed the pool over: the LRU walker pops the oldest cached-and-freed block, clears its hash via `BlockPool._maybe_evict_cached_block` (so future cache lookups miss), and forwards the block id to the elastic backend. The walker tolerates stale LRU entries — blocks re-acquired by `touch` or already un-cached by `get_new_blocks` — so the hook does not need to patch those code paths.
+
+The legacy `VLLM_METAL_PREFIX_CACHE` flag controls a separate, contiguous (non-paged) prefix cache that is structurally inactive whenever paged attention is on, and is therefore unaffected by elastic mode.

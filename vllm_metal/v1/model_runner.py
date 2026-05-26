@@ -1500,13 +1500,10 @@ class MetalModelRunner:
             self.metal_config.elastic_kv
             and self._paged_attention_backend is not None
         )
-        freed_block_ids: list[int] = []
 
         for req_id in evicted_req_ids:
             state = self._request_states.pop(req_id, None)
             if state is not None:
-                if elastic_kv and state.block_ids:
-                    freed_block_ids.extend(state.block_ids)
                 if state.cache:
                     del state.cache
                 del state
@@ -1516,21 +1513,16 @@ class MetalModelRunner:
             # Block freeing is handled by the scheduler's kv_cache_manager.
             self._paged_request_seq_lens.pop(req_id, None)
 
-        if elastic_kv and freed_block_ids:
-            # Queue the freed block ranges on the per-layer ElasticKVPools
-            # and trigger reclaim — the mmap dance + MTL::Buffer recreate
-            # is what actually releases physical pages back to the OS and
-            # refreshes the GPU's IOMMU mapping. cache.reclaim()
-            # synchronises before tearing down the old buffer.
+        if elastic_kv:
+            # ``BlockPool.free_blocks`` (patched in compat) has already queued
+            # the truly-released ranges — i.e. blocks that left the request
+            # AND aren't retained by vLLM's prefix cache — on the per-layer
+            # ElasticKVPools. We just trigger the synchronize + MTL::Buffer
+            # rebuild that actually drops the pages back to the OS.
             assert self._paged_attention_backend is not None
-            self._paged_attention_backend.mark_blocks_freed(freed_block_ids)
             released = self._paged_attention_backend.reclaim()
             if released:
-                logger.debug(
-                    "Elastic KV reclaimed %.2f MB across %d block ids",
-                    released / 1e6,
-                    len(freed_block_ids),
-                )
+                logger.debug("Elastic KV reclaimed %.2f MB", released / 1e6)
                 # Periodic INFO-level summary so users can monitor without
                 # turning on full debug logging. Logs every
                 # _ELASTIC_KV_LOG_EVERY reclaims by cumulative count.
