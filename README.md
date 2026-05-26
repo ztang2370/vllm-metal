@@ -120,7 +120,7 @@ If your Mac doesn't have enough memory to serve at `--max-model-len 64000`, you 
 
 **3. Drive the workload.** Start `hermes` in a second terminal and run whichever task you want to measure.
 
-### Optional: Rust frontend (experimental)
+## Optional: Rust frontend (experimental)
 
 Pass `--with-vllm-rs` to also install [`vllm-frontend-rs`](https://github.com/Inferact/vllm-frontend-rs), an experimental Rust drop-in for vLLM's serving layer. Requires the Rust toolchain (https://rustup.rs):
 
