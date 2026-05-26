@@ -69,6 +69,57 @@ VLLM_METAL_ELASTIC_KV=1 vllm serve <MODEL>
 
 See [docs/configuration.md](docs/configuration.md#elastic-kv-cache) for the full description.
 
+### Reproducing the agent workload benchmark
+
+End-to-end setup we use to compare kvcached against plain vllm-metal on a real tool-calling agent workload (Hermes CLI driving `Qwen/Qwen3-8B-MLX-4bit`).
+
+**1. Launch the server.** Run one of the two commands below in an activated `~/.venv-vllm-metal` shell. The only difference is the `VLLM_METAL_ELASTIC_KV=1` env var — everything else is identical so the comparison is apples-to-apples.
+
+The model's stock `max_position_embeddings` is 40960, so vLLM would otherwise cap `--max-model-len` below Hermes's 64k minimum. `--hf-overrides` applies the YaRN rope-scaling config from the [Qwen3-8B-MLX-4bit model card](https://huggingface.co/Qwen/Qwen3-8B-MLX-4bit) (`factor=4`, base 32768 → max position 131072), which is what unlocks `--max-model-len 64000`. Prefix caching is on by default for both runs (vLLM auto-enables it for supported models).
+
+Ours (kvcached on):
+```bash
+VLLM_METAL_ELASTIC_KV=1 \
+vllm serve Qwen/Qwen3-8B-MLX-4bit \
+  --max-model-len 64000 \
+  --hf-overrides '{"rope_scaling":{"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":32768}}' \
+  --enable-auto-tool-choice \
+  --tool-call-parser hermes \
+  --enable-log-requests
+```
+
+Baseline (kvcached off):
+```bash
+vllm serve Qwen/Qwen3-8B-MLX-4bit \
+  --max-model-len 64000 \
+  --hf-overrides '{"rope_scaling":{"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":32768}}' \
+  --enable-auto-tool-choice \
+  --tool-call-parser hermes \
+  --enable-log-requests
+```
+
+Flag notes:
+- `--enable-auto-tool-choice` + `--tool-call-parser hermes` make vLLM emit OpenAI-style `tool_calls` parsed out of the Qwen3 `<tool_call>...</tool_call>` blocks, which is the format the Hermes agent expects.
+- `--enable-log-requests` logs each request's prompt and generated output — handy for inspecting what the agent is sending.
+- Optional: cap how much of the KV pool the prefix cache may pin with `VLLM_METAL_ELASTIC_KV_MAX_CACHED_FRACTION=0.5` (defaults to no cap).
+
+**2. Configure the Hermes agent.** Point Hermes at the local vLLM endpoint by writing `~/.hermes/config.yaml`. Minimal `model:` block (the rest of the file can stay at defaults):
+
+```yaml
+model:
+  provider: vllm
+  model: Qwen/Qwen3-8B-MLX-4bit
+  base_url: http://127.0.0.1:8000/v1
+  api_key: none
+  context_length: 64000
+```
+
+`model` must match the served model id exactly. `context_length` is technically optional when `--max-model-len ≥ 64000` (Hermes will pick up the model's max from the server), but we set it explicitly to make the config self-documenting.
+
+If your Mac doesn't have enough memory to serve at `--max-model-len 64000`, you can drop the server below 64k (e.g. `--max-model-len 40000`) and keep `context_length: 64000` in the config purely to satisfy Hermes's ≥64k startup check. It's an imperfect workaround — Hermes will think it has 64k available and may send prompts the server then rejects — but for short-to-medium traces it works in practice.
+
+**3. Drive the workload.** Start `hermes` in a second terminal and run whichever task you want to measure.
+
 ### Optional: Rust frontend (experimental)
 
 Pass `--with-vllm-rs` to also install [`vllm-frontend-rs`](https://github.com/Inferact/vllm-frontend-rs), an experimental Rust drop-in for vLLM's serving layer. Requires the Rust toolchain (https://rustup.rs):
